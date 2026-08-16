@@ -1,0 +1,25 @@
+name: Bootstrap Jingu Freelancer labels
+on:
+  workflow_dispatch:
+permissions:
+  issues: write
+  contents: read
+jobs:
+  labels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const labels = [
+              ['jingu-report','cf222e','Denúncia enviada pelo Jingu Hub'],
+              ['pending','d4c5f9','Aguardando análise'],
+              ['resolved','2da44e','Denúncia analisada']
+            ];
+            for (const [name,color,description] of labels) {
+              try { await github.rest.issues.getLabel({...context.repo,name}); }
+              catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({...context.repo,name,color,description});
+              }
+            }
