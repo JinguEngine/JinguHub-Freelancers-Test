@@ -1,7 +1,7 @@
 name: Validate and sync Jingu Freelancer listing
 on:
   issues:
-    types: [opened, edited, reopened]
+    types: [opened, edited, reopened, closed]
 permissions:
   contents: read
   issues: write
@@ -10,16 +10,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Enforce listing contract and synchronize labels
+        env:
+          CONTINUITY_URL: ${{ vars.JINGU_CONTINUITY_URL }}
         uses: actions/github-script@v8
         with:
           script: |
             const issue = context.payload.issue;
             const body = issue?.body || '';
-            const match = body.match(/<!-- JINGU_FREELANCER_V1:([A-Za-z0-9_-]+) -->/);
+            const labelsNow = (issue.labels || []).map(label => typeof label === 'string' ? label : label.name).filter(Boolean);
+            const liveMatch = body.match(/<!-- JINGU_FREELANCER_V1:([A-Za-z0-9_-]+) -->/);
+            const deletedMatch = body.match(/<!-- JINGU_FREELANCER_DELETED_V1:(F-[A-Z0-9]{7}) -->/);
+            const deletedLabel = 'jingu:deleted';
+            const ensureDeletedLabel = async () => {
+              try { await github.rest.issues.getLabel({...context.repo,name:deletedLabel}); }
+              catch (e) { if (e.status !== 404) throw e; await github.rest.issues.createLabel({...context.repo,name:deletedLabel,color:'8b0000',description:'Anúncio removido permanentemente no Jingu Hub'}); }
+            };
+            const tombstone = async (displayId) => {
+              await ensureDeletedLabel();
+              await github.rest.issues.setLabels({...context.repo,issue_number:issue.number,labels:[deletedLabel]});
+              await github.rest.issues.update({...context.repo,issue_number:issue.number,state:'closed',title:`[Removido] ${displayId}`,body:`<!-- JINGU_FREELANCER_DELETED_V1:${displayId} -->\n\nAnúncio removido permanentemente pelo autor no Jingu Hub. O conteúdo e as curtidas não podem ser recuperados pelo produto.`});
+              try { await github.rest.issues.lock({...context.repo,issue_number:issue.number,lock_reason:'resolved'}); } catch {}
+            };
+            if (deletedMatch || labelsNow.includes(deletedLabel)) {
+              await ensureDeletedLabel();
+              if (!labelsNow.includes(deletedLabel)) await github.rest.issues.setLabels({...context.repo,issue_number:issue.number,labels:[deletedLabel]});
+              if (issue.state !== 'closed') await github.rest.issues.update({...context.repo,issue_number:issue.number,state:'closed'});
+              try { await github.rest.issues.lock({...context.repo,issue_number:issue.number,lock_reason:'resolved'}); } catch {}
+              return;
+            }
+            if (context.payload.action === 'closed' && liveMatch) {
+              let displayId = `F-${String(issue.number).padStart(7,'0').slice(-7)}`;
+              try { const raw=JSON.parse(Buffer.from(liveMatch[1], 'base64url').toString('utf8')); if (/^F-[A-Z0-9]{7}$/.test(raw?.display_id||'')) displayId=raw.display_id; } catch {}
+              await tombstone(displayId);
+              return;
+            }
+            const match = liveMatch;
             if (!match) return;
             let meta;
             try { meta = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8')); }
             catch { return; }
+
+            const author = issue.user?.login || '';
+            const freePlan = {tier:'free',active_post_limit:1,summary_max_chars:180,description_max_chars:3000,badge_label:null};
+            let plan = freePlan;
+            if (author && process.env.CONTINUITY_URL) {
+              try {
+                const response = await fetch(`${process.env.CONTINUITY_URL.replace(/\/$/,'')}/v1/membership/public/${encodeURIComponent(author)}`, {headers:{accept:'application/json'}});
+                if (response.ok) { const value=await response.json(); if (value && ['free','bronze','silver','gold','diamond'].includes(value.tier)) plan={...freePlan,...value}; }
+              } catch {}
+            }
 
             const markerEnd = body.indexOf(' -->', body.indexOf('<!-- JINGU_FREELANCER_V1:'));
             const details = '<!-- JINGU_FREELANCER_DETAILS -->';
@@ -33,10 +72,10 @@ jobs:
             const https = value => value == null || value === '' || (typeof value === 'string' && value.length <= 2048 && value.startsWith('https://'));
             const links = value => Array.isArray(value) && value.length <= 8 && value.every(link => link && typeof link.kind === 'string' && link.kind.length <= 30 && typeof link.label === 'string' && link.label.length <= 48 && typeof link.value === 'string' && link.value.length <= 2048);
             const schema = meta?.schema;
-            const summaryMax = schema >= 3 ? 180 : 280;
-            const descriptionMax = schema >= 3 ? 3000 : 10000;
+            const summaryMax = schema >= 4 ? Math.min(Number(plan.summary_max_chars)||180,500) : schema >= 3 ? 180 : 280;
+            const descriptionMax = schema >= 4 ? Math.min(Number(plan.description_max_chars)||3000,10000) : schema >= 3 ? 3000 : 10000;
             const displayOk = schema < 3 || (typeof meta.display_id === 'string' && /^F-[A-Z0-9]{7}$/.test(meta.display_id));
-            const baseValid = [1,2,3].includes(schema)
+            const baseValid = [1,2,3,4].includes(schema)
               && typeof issue?.title === 'string' && issue.title.trim().length >= 4 && issue.title.trim().length <= 120
               && typeof meta.summary === 'string' && meta.summary.trim().length >= 10 && meta.summary.trim().length <= summaryMax
               && description.length >= 20 && description.length <= descriptionMax
@@ -47,19 +86,18 @@ jobs:
               ? https(meta.portfolio_url) && https(meta.contact_url)
               : typeof meta.country === 'string' && meta.country.length <= 80 && typeof meta.region === 'string' && meta.region.length <= 100 && links(meta.portfolio_links) && links(meta.contact_links);
             if (!baseValid || !schemaValid) {
-              await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'Este anúncio não atende ao contrato atual do Jingu Hub e não será exibido. Edite-o pelo Jingu Hub.'});
+              await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'Este anúncio não atende ao contrato atual do Jingu Hub e foi encerrado. Crie um novo anúncio válido pelo Jingu Hub.'});
               await github.rest.issues.update({...context.repo, issue_number: issue.number, state: 'closed'});
               return;
             }
 
             // Server-side anti-spam guard. The repository—not the open-source client—
             // is authoritative: at most one active Jingu listing per GitHub author.
-            const author = issue.user?.login;
             if (author) {
               const rows = await github.paginate(github.rest.issues.listForRepo, {...context.repo, state:'open', creator:author, sort:'created', direction:'asc', per_page:100});
               const valid = rows.filter(row => !row.pull_request && /<!-- JINGU_FREELANCER_V1:[A-Za-z0-9_-]+ -->/.test(row.body || ''));
-              if (valid.length > 1 && valid[0].number !== issue.number) {
-                await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'O plano atual permite somente 1 anúncio ativo por usuário. Apague/feche o anúncio ativo anterior no Jingu Hub antes de criar outro.'});
+              if (valid.length > Number(plan.active_post_limit || 1) && !valid.slice(0,Number(plan.active_post_limit || 1)).some(row=>row.number===issue.number)) {
+                await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: `Seu plano atual permite ${Number(plan.active_post_limit || 1)} anúncio(s) ativo(s). Apague um anúncio ativo no Jingu Hub antes de criar outro.`});
                 await github.rest.issues.update({...context.repo, issue_number: issue.number, state: 'closed'});
                 return;
               }
@@ -82,9 +120,9 @@ jobs:
               }
             }
 
-            const managed = [`tipo:${meta.kind}`, `modalidade:${meta.compensation}`, ...meta.areas.map(v => `area:${v}`)];
+            const managed = [`tipo:${meta.kind}`, `modalidade:${meta.compensation}`, ...meta.areas.map(v => `area:${v}`), `jingu-plan:${plan.tier || 'free'}`];
             const existing = (issue.labels || []).map(label => typeof label === 'string' ? label : label.name).filter(Boolean);
-            const preserved = existing.filter(label => !/^(tipo:|modalidade:|area:)/.test(label));
+            const preserved = existing.filter(label => !/^(tipo:|modalidade:|area:|jingu-plan:)/.test(label) && label !== deletedLabel);
             const labels = [...preserved, ...managed];
             const definitions = {[`tipo:${meta.kind}`]:'7bc96f',[`modalidade:${meta.compensation}`]:'d4c5f9'};
             for (const label of labels) {
