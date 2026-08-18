@@ -1,4 +1,4 @@
-name: Sync Jingu freelancer labels
+name: Validate and sync Jingu Freelancer listing
 on:
   issues:
     types: [opened, edited, reopened]
@@ -6,39 +6,92 @@ permissions:
   contents: read
   issues: write
 jobs:
-  labels:
+  listing:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate marker and synchronize labels
+      - name: Enforce listing contract and synchronize labels
         uses: actions/github-script@v8
         with:
           script: |
-            const body = context.payload.issue?.body || '';
+            const issue = context.payload.issue;
+            const body = issue?.body || '';
             const match = body.match(/<!-- JINGU_FREELANCER_V1:([A-Za-z0-9_-]+) -->/);
             if (!match) return;
             let meta;
-            try {
-              meta = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
-            } catch { return; }
+            try { meta = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8')); }
+            catch { return; }
+
+            const markerEnd = body.indexOf(' -->', body.indexOf('<!-- JINGU_FREELANCER_V1:'));
+            const details = '<!-- JINGU_FREELANCER_DETAILS -->';
+            let description = markerEnd >= 0 ? body.slice(markerEnd + 4) : '';
+            if (description.includes(details)) description = description.split(details, 1)[0];
+            description = description.trim();
+
             const kinds = new Set(['recruiting', 'seeking']);
             const compensation = new Set(['paid', 'volunteer', 'negotiable']);
             const areas = new Set(['programming','art-2d','art-3d','game-design','ui-ux','animation','music','sound','qa','writing','production','marketing','community','other']);
             const https = value => value == null || value === '' || (typeof value === 'string' && value.length <= 2048 && value.startsWith('https://'));
-            if (meta?.schema !== 1 || typeof meta.summary !== 'string' || meta.summary.length < 10 || meta.summary.length > 280 || !kinds.has(meta.kind) || !compensation.has(meta.compensation) || !Array.isArray(meta.areas) || meta.areas.length < 1 || meta.areas.length > 6 || meta.areas.some(v => !areas.has(v)) || !https(meta.portfolio_url) || !https(meta.contact_url) || !https(meta.image_url)) return;
-            const managed = [`tipo:${meta.kind}`, `modalidade:${meta.compensation}`, ...meta.areas.map(v => `area:${v}`)];
-            const existing = (context.payload.issue?.labels || []).map(label => typeof label === 'string' ? label : label.name).filter(Boolean);
-            const preserved = existing.filter(label => !/^(tipo:|modalidade:|area:)/.test(label));
-            const labels = [...preserved, ...managed];
-            const definitions = {
-              [`tipo:${meta.kind}`]: '7bc96f',
-              [`modalidade:${meta.compensation}`]: 'd4c5f9',
-            };
-            for (const label of labels) {
-              try {
-                await github.rest.issues.getLabel({owner: context.repo.owner, repo: context.repo.repo, name: label});
-              } catch (e) {
-                if (e.status !== 404) throw e;
-                await github.rest.issues.createLabel({owner: context.repo.owner, repo: context.repo.repo, name: label, color: definitions[label] || '6e7681'});
+            const links = value => Array.isArray(value) && value.length <= 8 && value.every(link => link && typeof link.kind === 'string' && link.kind.length <= 30 && typeof link.label === 'string' && link.label.length <= 48 && typeof link.value === 'string' && link.value.length <= 2048);
+            const schema = meta?.schema;
+            const summaryMax = schema >= 3 ? 180 : 280;
+            const descriptionMax = schema >= 3 ? 3000 : 10000;
+            const displayOk = schema < 3 || (typeof meta.display_id === 'string' && /^F-[A-Z0-9]{7}$/.test(meta.display_id));
+            const baseValid = [1,2,3].includes(schema)
+              && typeof issue?.title === 'string' && issue.title.trim().length >= 4 && issue.title.trim().length <= 120
+              && typeof meta.summary === 'string' && meta.summary.trim().length >= 10 && meta.summary.trim().length <= summaryMax
+              && description.length >= 20 && description.length <= descriptionMax
+              && displayOk && kinds.has(meta.kind) && compensation.has(meta.compensation)
+              && Array.isArray(meta.areas) && meta.areas.length >= 1 && meta.areas.length <= 6
+              && new Set(meta.areas).size === meta.areas.length && !meta.areas.some(v => !areas.has(v)) && https(meta.image_url);
+            const schemaValid = schema === 1
+              ? https(meta.portfolio_url) && https(meta.contact_url)
+              : typeof meta.country === 'string' && meta.country.length <= 80 && typeof meta.region === 'string' && meta.region.length <= 100 && links(meta.portfolio_links) && links(meta.contact_links);
+            if (!baseValid || !schemaValid) {
+              await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'Este anúncio não atende ao contrato atual do Jingu Hub e não será exibido. Edite-o pelo Jingu Hub.'});
+              await github.rest.issues.update({...context.repo, issue_number: issue.number, state: 'closed'});
+              return;
+            }
+
+            // Server-side anti-spam guard. The repository—not the open-source client—
+            // is authoritative: at most one active Jingu listing per GitHub author.
+            const author = issue.user?.login;
+            if (author) {
+              const rows = await github.paginate(github.rest.issues.listForRepo, {...context.repo, state:'open', creator:author, sort:'created', direction:'asc', per_page:100});
+              const valid = rows.filter(row => !row.pull_request && /<!-- JINGU_FREELANCER_V1:[A-Za-z0-9_-]+ -->/.test(row.body || ''));
+              if (valid.length > 1 && valid[0].number !== issue.number) {
+                await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'O plano atual permite somente 1 anúncio ativo por usuário. Apague/feche o anúncio ativo anterior no Jingu Hub antes de criar outro.'});
+                await github.rest.issues.update({...context.repo, issue_number: issue.number, state: 'closed'});
+                return;
               }
             }
-            await github.rest.issues.setLabels({owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, labels});
+
+            if (schema >= 3) {
+              const rows = await github.paginate(github.rest.issues.listForRepo, {...context.repo, state:'open', per_page:100});
+              for (const row of rows) {
+                if (row.number === issue.number || row.pull_request) continue;
+                const other = (row.body || '').match(/<!-- JINGU_FREELANCER_V1:([A-Za-z0-9_-]+) -->/);
+                if (!other) continue;
+                try {
+                  const otherMeta = JSON.parse(Buffer.from(other[1], 'base64url').toString('utf8'));
+                  if (otherMeta?.display_id === meta.display_id) {
+                    await github.rest.issues.createComment({...context.repo, issue_number: issue.number, body: 'Identificador de anúncio duplicado. Crie o anúncio novamente pelo Jingu Hub.'});
+                    await github.rest.issues.update({...context.repo, issue_number: issue.number, state:'closed'});
+                    return;
+                  }
+                } catch {}
+              }
+            }
+
+            const managed = [`tipo:${meta.kind}`, `modalidade:${meta.compensation}`, ...meta.areas.map(v => `area:${v}`)];
+            const existing = (issue.labels || []).map(label => typeof label === 'string' ? label : label.name).filter(Boolean);
+            const preserved = existing.filter(label => !/^(tipo:|modalidade:|area:)/.test(label));
+            const labels = [...preserved, ...managed];
+            const definitions = {[`tipo:${meta.kind}`]:'7bc96f',[`modalidade:${meta.compensation}`]:'d4c5f9'};
+            for (const label of labels) {
+              try { await github.rest.issues.getLabel({...context.repo,name:label}); }
+              catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({...context.repo,name:label,color:definitions[label] || '6e7681'});
+              }
+            }
+            await github.rest.issues.setLabels({...context.repo,issue_number:issue.number,labels});
