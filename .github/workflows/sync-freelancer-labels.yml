@@ -18,6 +18,30 @@ jobs:
             const issue = context.payload.issue;
             const body = issue?.body || '';
             const labelsNow = (issue.labels || []).map(label => typeof label === 'string' ? label : label.name).filter(Boolean);
+
+            // Reports are ordinary Issues created by users who usually cannot manage
+            // repository labels. Provision/apply moderation labels with the repository-
+            // owned Actions token so reporting never depends on a manual bootstrap job.
+            const reportMatch = body.match(/<!-- JINGU_REPORT_V1 target=\d+ reporter=\d+ -->/);
+            if (reportMatch) {
+              const reportDefinitions = [
+                ['jingu-report','cf222e','Denúncia enviada pelo Jingu Hub'],
+                ['pending','d4c5f9','Aguardando análise'],
+                ['resolved','2da44e','Denúncia analisada'],
+              ];
+              for (const [name,color,description] of reportDefinitions) {
+                try { await github.rest.issues.getLabel({...context.repo,name}); }
+                catch (e) {
+                  if (e.status !== 404) throw e;
+                  await github.rest.issues.createLabel({...context.repo,name,color,description});
+                }
+              }
+              const statusLabel = labelsNow.includes('resolved') ? 'resolved' : 'pending';
+              const preserved = labelsNow.filter(label => !['jingu-report','pending','resolved'].includes(label));
+              await github.rest.issues.setLabels({...context.repo,issue_number:issue.number,labels:[...preserved,'jingu-report',statusLabel]});
+              return;
+            }
+
             const liveMatch = body.match(/<!-- JINGU_FREELANCER_V1:([A-Za-z0-9_-]+) -->/);
             const deletedMatch = body.match(/<!-- JINGU_FREELANCER_DELETED_V1:(F-[A-Z0-9]{7}) -->/);
             const deletedLabel = 'jingu:deleted';
